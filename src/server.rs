@@ -29,7 +29,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::{
     io::AsyncReadExt,
-    sync::{RwLock, broadcast},
+    sync::{RwLock, broadcast, watch},
 };
 
 use crate::{
@@ -49,6 +49,7 @@ pub struct AppState {
     catalog: Arc<RwLock<Arc<Catalog>>>,
     renderer: Arc<MarkdownRenderer>,
     reloads: broadcast::Sender<ReloadEvent>,
+    shutdown: watch::Sender<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -126,10 +127,12 @@ impl AppState {
     #[must_use]
     pub fn new(catalog: Catalog) -> Self {
         let (reloads, _) = broadcast::channel(64);
+        let (shutdown, _) = watch::channel(false);
         Self {
             catalog: Arc::new(RwLock::new(Arc::new(catalog))),
             renderer: Arc::new(MarkdownRenderer::new()),
             reloads,
+            shutdown,
         }
     }
 
@@ -155,6 +158,15 @@ impl AppState {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<ReloadEvent> {
         self.reloads.subscribe()
+    }
+
+    pub fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    #[must_use]
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 }
 
@@ -432,24 +444,37 @@ async fn missing(Path(path): Path<String>) -> Response {
 
 async fn events(State(state): State<AppState>) -> Response {
     let mut receiver = state.reloads.subscribe();
+    let mut shutdown = state.subscribe_shutdown();
     let stream = async_stream::stream! {
+        if *shutdown.borrow() {
+            return;
+        }
         loop {
-            match receiver.recv().await {
-                Ok(change) => {
-                    let event = Event::default()
-                        .event("reload")
-                        .json_data(change)
-                        .expect("reload events serialize");
-                    yield Ok::<Event, Infallible>(event);
+            tokio::select! {
+                result = receiver.recv() => {
+                    match result {
+                        Ok(change) => {
+                            let event = Event::default()
+                                .event("reload")
+                                .json_data(change)
+                                .expect("reload events serialize");
+                            yield Ok::<Event, Infallible>(event);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let event = Event::default()
+                                .event("reload")
+                                .json_data(ReloadEvent::catalog())
+                                .expect("reload events serialize");
+                            yield Ok::<Event, Infallible>(event);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let event = Event::default()
-                        .event("reload")
-                        .json_data(ReloadEvent::catalog())
-                        .expect("reload events serialize");
-                    yield Ok::<Event, Infallible>(event);
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -705,6 +730,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn appearance_controls_render_before_css_without_weakening_csp() {
+        let (_temp, state) = fixture();
+        for uri in [
+            "/_mdfolio/shelf",
+            "/_mdfolio/doc/README.md",
+            "/_mdfolio/missing/not-here.md",
+        ] {
+            let response = app(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            let csp = response
+                .headers()
+                .get(CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(csp.contains("script-src 'self'"));
+            assert!(!csp.contains("'unsafe-inline'"));
+
+            let body = body_text(response).await;
+            assert!(body.contains("data-theme-toggle"));
+            assert!(body.contains("data-theme-menu"));
+            assert!(body.contains("data-mode-toggle"));
+            let script = body.find("/_mdfolio/static/app.js").unwrap();
+            let style = body.find("/_mdfolio/static/style.css").unwrap();
+            assert!(script < style);
+        }
+    }
+
+    #[tokio::test]
     async fn svg_assets_are_confined_and_sandboxed() {
         let (_temp, state) = fixture();
         let response = app(state)
@@ -921,6 +979,28 @@ mod tests {
         let data = String::from_utf8(data.to_vec()).unwrap();
         assert!(data.contains("event: reload"));
         assert!(data.contains("\"kind\":\"catalog\""));
+    }
+
+    #[tokio::test]
+    async fn event_stream_ends_when_shutdown_begins() {
+        let (_temp, state) = fixture();
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/_mdfolio/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        state.begin_shutdown();
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("event stream did not observe shutdown");
+        assert!(frame.is_none(), "event stream emitted after shutdown");
     }
 
     #[tokio::test]

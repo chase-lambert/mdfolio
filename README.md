@@ -41,6 +41,26 @@ mdfolio ~/projects --port 4040
 
 The server remains in the foreground until `Ctrl-C`.
 
+## Appearance
+
+Use the controls in the page header to choose a theme and switch between light
+and dark modes. The built-in themes are:
+
+- **Folio** — warm paper and umber;
+- **Linen** — airy neutrals and cool blue;
+- **Grove** — mineral and botanical tones;
+- **Nocturne (dark)** — a dark-only indigo theme.
+
+Theme and mode are remembered independently in browser storage. A dark-only
+theme temporarily uses dark mode without changing the preferred mode that
+returns with a light-and-dark theme. Before a mode is chosen explicitly,
+`mdfolio` follows the operating-system preference.
+
+Browser storage is scoped to the complete local address, including its port.
+The default available port may change between launches; use a stable
+`--port`, such as `--port 4040`, to keep one remembered appearance across
+restarts.
+
 ## Reading model
 
 - `.md` and `.markdown` files are discovered recursively and matched
@@ -97,6 +117,9 @@ rather than loaded into memory as whole files.
 cargo fmt -- --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+node --check assets/app.js
+node --test assets/app.test.js
+git diff --check
 cargo build --release
 ```
 

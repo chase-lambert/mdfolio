@@ -66,8 +66,12 @@ async fn main() -> Result<()> {
         eprintln!("warning: could not open the browser: {error}");
     }
 
+    let shutdown_state = state.clone();
     axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_state.begin_shutdown();
+        })
         .await
         .context("local server failed")?;
 
