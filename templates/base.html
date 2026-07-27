@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>{{ page_title }}</title>
+    <link rel="icon" href="/_mdfolio/static/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/_mdfolio/static/style.css">
+    <script defer src="/_mdfolio/static/app.js"></script>
+  </head>
+  <body class="{{ body_class }}" data-document="{{ current_document }}">
+    {% block body %}{% endblock %}
+  </body>
+</html>

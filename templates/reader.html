@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block body %}
+<header class="reader-bar">
+  <button class="nav-toggle" type="button" data-nav-toggle aria-controls="folio-navigation" aria-expanded="false">
+    <span aria-hidden="true">☰</span>
+    <span>Contents</span>
+  </button>
+  <a class="wordmark" href="/_mdfolio/shelf">mdfolio</a>
+  <span class="reader-library">{{ library_name }}</span>
+</header>
+
+<div class="reader-shell">
+  <aside class="folio-nav" id="folio-navigation" data-nav>
+    <div class="nav-heading">
+      {% if show_shelf_link %}
+      <a class="back-link" href="/_mdfolio/shelf">← Repository shelf</a>
+      {% endif %}
+      <p class="eyebrow">{{ library_name }}</p>
+      <label class="filter-field nav-filter">
+        <span>Find a page</span>
+        <input data-filter type="search" autocomplete="off" placeholder="Title or path">
+      </label>
+    </div>
+    <nav class="document-list" aria-label="Markdown documents" data-filter-list>
+      {% for entry in navigation %}
+      <a class="document-link{% if entry.current %} is-current{% endif %}" href="{{ entry.href }}" data-filter-item data-filter-value="{{ entry.filter_value }}"{% if entry.current %} aria-current="page"{% endif %}>
+        <strong>{{ entry.title }}</strong>
+        <small>{{ entry.path }}</small>
+      </a>
+      {% endfor %}
+    </nav>
+  </aside>
+
+  <main class="reading-pane">
+    <p class="document-path">{{ document_path }}</p>
+    <article class="markdown-body">
+      {{ article_html|safe }}
+    </article>
+  </main>
+</div>
+{% endblock %}

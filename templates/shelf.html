@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block body %}
+<header class="masthead">
+  <a class="wordmark" href="/_mdfolio/shelf" aria-label="mdfolio shelf">mdfolio</a>
+  <p class="root-path">{{ root_path }}</p>
+</header>
+
+<main class="shelf-shell">
+  <div class="shelf-heading">
+    <p class="eyebrow">Repository shelf</p>
+    <h1>Choose a folio.</h1>
+    <p class="shelf-intro">The Markdown already here, gathered without rearranging it.</p>
+  </div>
+
+  {% if show_filter %}
+  <label class="filter-field">
+    <span>Filter</span>
+    <input data-filter type="search" autocomplete="off" placeholder="Repository or path">
+  </label>
+  {% endif %}
+
+  <div class="shelf-list" data-filter-list>
+    {% for collection in collections %}
+    <a class="shelf-row" href="{{ collection.href }}" data-filter-item data-filter-value="{{ collection.filter_value }}">
+      <span class="shelf-row-main">
+        <strong>{{ collection.name }}</strong>
+        {% if collection.has_qualifier %}
+        <small>{{ collection.qualifier }}</small>
+        {% endif %}
+      </span>
+      <span class="shelf-arrow" aria-hidden="true">→</span>
+    </a>
+    {% endfor %}
+  </div>
+
+  {% if empty %}
+  <section class="empty-state">
+    <h2>No Markdown found.</h2>
+    <p>This shelf is ready; add an <code>.md</code> or <code>.markdown</code> file beneath the selected directory.</p>
+  </section>
+  {% endif %}
+
+  {% if has_diagnostics %}
+  <p class="quiet-warning">Some paths could not be read. Details were printed in the terminal.</p>
+  {% endif %}
+</main>
+{% endblock %}
