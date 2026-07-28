@@ -7,6 +7,8 @@ of repositories to browse them as a shelf.
 It does not import, reorganize, or generate documentation. The filesystem is
 the catalog.
 
+![mdfolio reading a repository README](assets/mdfolio-reader.png)
+
 ## Install
 
 Build and install the current checkout with Cargo:
