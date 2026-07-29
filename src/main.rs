@@ -1,84 +1,214 @@
 use std::{
+    env,
+    error::Error,
+    ffi::{OsStr, OsString},
+    fmt, io,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
+    process::{Command, ExitCode, Stdio},
+    thread,
 };
 
-use anyhow::{Context, Result};
-use clap::Parser;
 use mdfolio::{
     catalog::Catalog,
     server::{AppState, app},
-    watcher,
 };
 use tokio::net::TcpListener;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "mdfolio",
-    version,
-    about = "Read the Markdown already in your repositories"
-)]
+const HELP: &str = "\
+Read the Markdown already in your repositories
+
+Usage: mdfolio [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]  Directory to gather. Defaults to the current directory [default: .]
+
+Options:
+      --no-open      Keep the browser closed and print the local URL
+      --port <PORT>  Loopback port. Zero chooses an available port [default: 0]
+  -h, --help         Print help
+  -V, --version      Print version
+";
+
+#[derive(Debug, Eq, PartialEq)]
 struct Cli {
-    /// Directory to gather. Defaults to the current directory.
-    #[arg(default_value = ".")]
     path: PathBuf,
-
-    /// Keep the browser closed and print the local URL.
-    #[arg(long)]
     no_open: bool,
-
-    /// Loopback port. Zero chooses an available port.
-    #[arg(long, default_value_t = 0)]
     port: u16,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .without_time()
-        .with_target(false)
-        .with_max_level(tracing::Level::WARN)
-        .init();
+#[derive(Debug, Eq, PartialEq)]
+enum CliAction {
+    Run(Cli),
+    Help,
+    Version,
+}
 
-    let cli = Cli::parse();
+#[derive(Debug, Eq, PartialEq)]
+struct CliError(String);
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for CliError {}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    match parse_args(env::args_os().skip(1)) {
+        Ok(CliAction::Help) => {
+            print!("{HELP}");
+            ExitCode::SUCCESS
+        }
+        Ok(CliAction::Version) => {
+            println!("mdfolio {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Ok(CliAction::Run(cli)) => match run(cli).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("error: {error}\n\nFor more information, try '--help'.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn parse_args<I, S>(args: I) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let mut path = None;
+    let mut no_open = false;
+    let mut port = 0;
+    let mut positional_only = false;
+
+    while let Some(argument) = args.next() {
+        if !positional_only {
+            if argument == "--" {
+                positional_only = true;
+                continue;
+            }
+            if argument == "-h" || argument == "--help" {
+                return Ok(CliAction::Help);
+            }
+            if argument == "-V" || argument == "--version" {
+                return Ok(CliAction::Version);
+            }
+            if argument == "--no-open" {
+                no_open = true;
+                continue;
+            }
+            if argument == "--port" {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError("--port requires a value".to_owned()))?;
+                port = parse_port(&value)?;
+                continue;
+            }
+            if let Some(value) = argument
+                .to_str()
+                .and_then(|argument| argument.strip_prefix("--port="))
+            {
+                port = parse_port(OsStr::new(value))?;
+                continue;
+            }
+            if argument.as_encoded_bytes().starts_with(b"-") {
+                return Err(CliError(format!(
+                    "unexpected argument '{}'",
+                    argument.to_string_lossy()
+                )));
+            }
+        }
+
+        if path.replace(PathBuf::from(&argument)).is_some() {
+            return Err(CliError(format!(
+                "unexpected second path '{}'",
+                argument.to_string_lossy()
+            )));
+        }
+    }
+
+    Ok(CliAction::Run(Cli {
+        path: path.unwrap_or_else(|| PathBuf::from(".")),
+        no_open,
+        port,
+    }))
+}
+
+fn parse_port(value: &OsStr) -> Result<u16, CliError> {
+    let printable = value.to_string_lossy();
+    let value = value
+        .to_str()
+        .ok_or_else(|| CliError(format!("invalid port '{printable}'")))?;
+    value.parse().map_err(|_| {
+        CliError(format!(
+            "invalid port '{printable}'; expected 0 through 65535"
+        ))
+    })
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let catalog = Catalog::scan(&cli.path)?;
     print_catalog_summary(&catalog);
 
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, cli.port)))
         .await
-        .with_context(|| format!("could not bind 127.0.0.1:{}", cli.port))?;
+        .map_err(|source| {
+            io::Error::new(
+                source.kind(),
+                format!("could not bind 127.0.0.1:{}: {source}", cli.port),
+            )
+        })?;
     let address = listener.local_addr()?;
     let state = AppState::new(catalog);
-    let watch_runtime = match watcher::start(state.clone()).await {
-        Ok(runtime) => Some(runtime),
-        Err(error) => {
-            eprintln!("warning: live reload unavailable: {error}");
-            None
-        }
-    };
 
     let url = format!("http://{address}/_mdfolio/");
     println!("{url}");
 
-    if !cli.no_open
-        && let Err(error) = webbrowser::open(&url)
-    {
-        eprintln!("warning: could not open the browser: {error}");
+    if !cli.no_open {
+        open_browser(url);
     }
 
-    let shutdown_state = state.clone();
     axum::serve(listener, app(state))
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown_state.begin_shutdown();
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("local server failed")?;
+        .map_err(|source| {
+            io::Error::new(source.kind(), format!("local server failed: {source}"))
+        })?;
 
-    if let Some(runtime) = watch_runtime {
-        runtime.shutdown().await;
-    }
     Ok(())
+}
+
+fn open_browser(url: String) {
+    let result = thread::Builder::new()
+        .name("mdfolio-xdg-open".to_owned())
+        .spawn(move || {
+            match Command::new("xdg-open")
+                .arg(&url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    eprintln!("warning: could not open the browser: xdg-open exited with {status}");
+                }
+                Err(error) => eprintln!("warning: could not open the browser: {error}"),
+            }
+        });
+    if let Err(error) = result {
+        eprintln!("warning: could not start the browser opener: {error}");
+    }
 }
 
 fn print_catalog_summary(catalog: &Catalog) {
@@ -99,6 +229,105 @@ fn print_catalog_summary(catalog: &Catalog) {
 
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!("could not listen for Ctrl-C: {error}");
+        eprintln!("warning: could not listen for Ctrl-C: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsString,
+        path::{Path, PathBuf},
+    };
+
+    use super::{Cli, CliAction, parse_args};
+
+    fn parse(args: &[&str]) -> Result<CliAction, String> {
+        parse_args(args.iter().copied()).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn defaults_to_the_current_directory_and_an_available_port() {
+        assert_eq!(
+            parse(&[]),
+            Ok(CliAction::Run(Cli {
+                path: PathBuf::from("."),
+                no_open: false,
+                port: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn accepts_documented_flags_in_either_order_and_both_port_forms() {
+        assert_eq!(
+            parse(&["docs", "--no-open", "--port", "4040"]),
+            Ok(CliAction::Run(Cli {
+                path: PathBuf::from("docs"),
+                no_open: true,
+                port: 4040,
+            }))
+        );
+        assert_eq!(
+            parse(&["--port=0", "--no-open", "docs"]),
+            Ok(CliAction::Run(Cli {
+                path: PathBuf::from("docs"),
+                no_open: true,
+                port: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn double_dash_allows_a_path_that_starts_with_a_dash() {
+        assert_eq!(
+            parse(&["--", "-folio"]),
+            Ok(CliAction::Run(Cli {
+                path: PathBuf::from("-folio"),
+                no_open: false,
+                port: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn help_and_version_keep_short_and_long_forms() {
+        assert_eq!(parse(&["-h"]), Ok(CliAction::Help));
+        assert_eq!(parse(&["--help"]), Ok(CliAction::Help));
+        assert_eq!(parse(&["-V"]), Ok(CliAction::Version));
+        assert_eq!(parse(&["--version"]), Ok(CliAction::Version));
+    }
+
+    #[test]
+    fn rejects_invalid_ports_unknown_flags_and_multiple_paths() {
+        for args in [
+            &["--port"][..],
+            &["--port", "nope"],
+            &["--port=-1"],
+            &["--port=65536"],
+            &["--no-open=true"],
+            &["--unknown"],
+            &["first", "second"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_positional_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = OsString::from_vec(vec![b'f', 0x80]);
+        let parsed = parse_args([path.clone()]).unwrap();
+
+        assert_eq!(
+            parsed,
+            CliAction::Run(Cli {
+                path: Path::new(&path).to_path_buf(),
+                no_open: false,
+                port: 0,
+            })
+        );
     }
 }

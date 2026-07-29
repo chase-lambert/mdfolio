@@ -15,12 +15,40 @@ use crate::{
     pathing::{APP_PREFIX, asset_url, document_url, missing_url, normalize_library_path},
 };
 
-const IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "svg", "webp", "avif"];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetKind {
-    Image,
+    Png,
+    Jpeg,
+    Gif,
+    Svg,
+    Webp,
+    Avif,
     Pdf,
+}
+
+impl AssetKind {
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Svg => "image/svg+xml",
+            Self::Webp => "image/webp",
+            Self::Avif => "image/avif",
+            Self::Pdf => "application/pdf",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_pdf(self) -> bool {
+        matches!(self, Self::Pdf)
+    }
+
+    #[must_use]
+    pub const fn is_svg(self) -> bool {
+        matches!(self, Self::Svg)
+    }
 }
 
 #[derive(Debug)]
@@ -203,26 +231,29 @@ fn split_fragment(url: &str) -> (&str, Option<&str>) {
 }
 
 fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            IMAGE_EXTENSIONS
-                .iter()
-                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
-        })
+    asset_kind(path).is_some_and(|kind| !kind.is_pdf())
 }
 
 fn is_pdf(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+    asset_kind(path).is_some_and(AssetKind::is_pdf)
 }
 
 #[must_use]
 pub fn asset_kind(path: &Path) -> Option<AssetKind> {
-    if is_image(path) {
-        Some(AssetKind::Image)
-    } else if is_pdf(path) {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("png") {
+        Some(AssetKind::Png)
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Some(AssetKind::Jpeg)
+    } else if extension.eq_ignore_ascii_case("gif") {
+        Some(AssetKind::Gif)
+    } else if extension.eq_ignore_ascii_case("svg") {
+        Some(AssetKind::Svg)
+    } else if extension.eq_ignore_ascii_case("webp") {
+        Some(AssetKind::Webp)
+    } else if extension.eq_ignore_ascii_case("avif") {
+        Some(AssetKind::Avif)
+    } else if extension.eq_ignore_ascii_case("pdf") {
         Some(AssetKind::Pdf)
     } else {
         None
@@ -235,7 +266,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::MarkdownRenderer;
+    use super::{AssetKind, MarkdownRenderer, asset_kind};
     use crate::catalog::Catalog;
 
     fn fixture() -> (TempDir, Arc<Catalog>) {
@@ -310,5 +341,23 @@ mod tests {
 
         assert!(!html.contains("secret.pdf"));
         assert!(html.contains("/_mdfolio/missing/page.html"));
+    }
+
+    #[test]
+    fn allowed_asset_extensions_have_exact_case_insensitive_content_types() {
+        for (path, kind, content_type) in [
+            ("cover.png", AssetKind::Png, "image/png"),
+            ("photo.jpg", AssetKind::Jpeg, "image/jpeg"),
+            ("photo.JPEG", AssetKind::Jpeg, "image/jpeg"),
+            ("motion.gif", AssetKind::Gif, "image/gif"),
+            ("diagram.SVG", AssetKind::Svg, "image/svg+xml"),
+            ("photo.webp", AssetKind::Webp, "image/webp"),
+            ("photo.avif", AssetKind::Avif, "image/avif"),
+            ("paper.PDF", AssetKind::Pdf, "application/pdf"),
+        ] {
+            assert_eq!(asset_kind(Path::new(path)), Some(kind), "{path}");
+            assert_eq!(kind.content_type(), content_type, "{path}");
+        }
+        assert_eq!(asset_kind(Path::new("page.html")), None);
     }
 }

@@ -41,7 +41,9 @@ mdfolio ~/projects --no-open
 mdfolio ~/projects --port 4040
 ```
 
-The server remains in the foreground until `Ctrl-C`.
+On Linux, browser opening uses `xdg-open`. If it is unavailable or fails, the
+local URL remains printed for manual opening. The server remains in the
+foreground until `Ctrl-C`.
 
 ## Appearance
 
@@ -77,9 +79,10 @@ restarts.
 - Repository-local `.gitignore`, `.git/info/exclude`, and `.ignore` files are
   honored. Common dependency and build caches are always excluded.
 - Hidden authoring directories such as `.agents` remain visible unless ignored.
-- Saving Markdown refreshes the affected reader. Navigation reloads only when
-  the catalog changes; unrelated source builds and Git activity do not reload
-  the page.
+- Refresh the browser to pick up Markdown edits and current filesystem
+  membership. `mdfolio` also rescans when opening the library, navigating its
+  shelf or readers, or revisiting a previously missing document; it does not
+  watch files or refresh pages in the background.
 - The shelf and page list filter by repository name, title, and path. Press `/`
   outside a form field to focus the filter.
 
@@ -87,7 +90,8 @@ restarts.
 
 Rendering supports CommonMark and common GitHub-flavored features, including
 tables, task lists, strikethrough, footnotes, description lists, heading
-anchors, and server-side syntax highlighting.
+anchors, and server-side syntax highlighting. Fenced languages outside
+Syntect's built-in syntax set remain readable as plain code.
 
 Relative Markdown links resolve through the catalog. Extensionless links,
 directory links, scan-root-relative links, and heading fragments are supported.
@@ -125,7 +129,22 @@ git diff --check
 cargo build --release
 ```
 
+## Architecture
+
+Each direct runtime dependency has one narrow job:
+
+- `comrak` parses Markdown and integrates Syntect highlighting; `ammonia`
+  sanitizes the resulting HTML; `askama` escapes and renders the application
+  shell.
+- `axum` serves loopback HTTP on Tokio; only Axum's `http1` and `tokio`
+  features are enabled, and Tokio enables only the filesystem, I/O, macros,
+  networking, current-thread runtime, and signal support used by the binary.
+- `ignore` applies Git-compatible discovery rules on each catalog scan.
+- `async-stream` expresses bounded asset streams; `percent-encoding` makes
+  browser paths unambiguous; and `thiserror` defines the catalog and server
+  error boundaries.
+
 The catalog in `src/catalog.rs` is the canonical data core. HTTP and rendering
 code address documents by stable root-relative paths rather than scan-order
-IDs. The watcher observes only ignore-aware directories and coalesces relevant
-events before replacing the catalog.
+IDs. Each shelf or reader request owns a fresh catalog scan, while application
+state retains only the canonical library root and Markdown renderer.

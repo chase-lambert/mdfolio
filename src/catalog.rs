@@ -1,8 +1,7 @@
 use std::{
-    collections::{BTreeSet, HashMap, hash_map::DefaultHasher},
+    collections::{BTreeSet, HashMap},
     ffi::OsStr,
     fs::{self, File},
-    hash::{Hash, Hasher},
     io::{self, Read},
     path::{Path, PathBuf},
 };
@@ -69,9 +68,7 @@ pub struct Catalog {
     documents: Vec<Document>,
     loose_documents: Vec<DocumentId>,
     by_path: HashMap<PathBuf, DocumentId>,
-    watch_directories: Vec<PathBuf>,
     diagnostics: Vec<CatalogDiagnostic>,
-    fingerprint: u64,
 }
 
 #[derive(Debug, Error)]
@@ -106,7 +103,6 @@ impl Catalog {
 
         let mut diagnostics = Vec::new();
         let mut pending = Vec::new();
-        let mut watch_directories = Vec::new();
 
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -134,9 +130,6 @@ impl Catalog {
                 }
             };
             if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                if let Ok(relative) = entry.path().strip_prefix(&root) {
-                    watch_directories.push(relative.to_path_buf());
-                }
                 continue;
             }
             if !entry.file_type().is_some_and(|kind| kind.is_file())
@@ -264,9 +257,6 @@ impl Catalog {
         } else {
             CatalogMode::Shelf
         };
-        let fingerprint = catalog_fingerprint(mode, &repositories, &documents, &loose_documents);
-        watch_directories.sort();
-        watch_directories.dedup();
         Ok(Self {
             root,
             mode,
@@ -274,9 +264,7 @@ impl Catalog {
             documents,
             loose_documents,
             by_path,
-            watch_directories,
             diagnostics,
-            fingerprint,
         })
     }
 
@@ -314,16 +302,6 @@ impl Catalog {
     #[must_use]
     pub fn diagnostics(&self) -> &[CatalogDiagnostic] {
         &self.diagnostics
-    }
-
-    #[must_use]
-    pub fn watch_directories(&self) -> &[PathBuf] {
-        &self.watch_directories
-    }
-
-    #[must_use]
-    pub fn fingerprint(&self) -> u64 {
-        self.fingerprint
     }
 
     #[must_use]
@@ -583,35 +561,6 @@ fn qualify_duplicate_repository_names(repositories: &mut [Repository]) {
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .map(|parent| parent.to_string_lossy().into_owned());
         }
-    }
-}
-
-fn catalog_fingerprint(
-    mode: CatalogMode,
-    repositories: &[Repository],
-    documents: &[Document],
-    loose_documents: &[DocumentId],
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    mode.hash(&mut hasher);
-    for repository in repositories {
-        repository.root_relative.hash(&mut hasher);
-        repository.name.hash(&mut hasher);
-        repository.qualifier.hash(&mut hasher);
-        repository.documents.hash(&mut hasher);
-    }
-    for document in documents {
-        document.relative_path.hash(&mut hasher);
-        document.title.hash(&mut hasher);
-        document.repository.hash(&mut hasher);
-    }
-    loose_documents.hash(&mut hasher);
-    hasher.finish()
-}
-
-impl Hash for CatalogMode {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        (*self as u8).hash(state);
     }
 }
 

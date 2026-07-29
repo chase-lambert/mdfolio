@@ -1,9 +1,7 @@
 use std::{
-    convert::Infallible,
     io,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use askama::Template;
@@ -19,22 +17,15 @@ use axum::{
         },
     },
     middleware::{self, Next},
-    response::{
-        Html, IntoResponse, Redirect, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
-use serde::Serialize;
 use thiserror::Error;
-use tokio::{
-    io::AsyncReadExt,
-    sync::{RwLock, broadcast, watch},
-};
+use tokio::io::AsyncReadExt;
 
 use crate::{
-    catalog::{Catalog, DocumentId, Landing},
-    markdown::{AssetKind, MarkdownRenderer, asset_kind},
+    catalog::{Catalog, DocumentId, Landing, ScanError},
+    markdown::{MarkdownRenderer, asset_kind},
     pathing::{document_url, normalize_library_path},
 };
 
@@ -46,16 +37,8 @@ const ASSET_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    catalog: Arc<RwLock<Arc<Catalog>>>,
+    root: Arc<PathBuf>,
     renderer: Arc<MarkdownRenderer>,
-    reloads: broadcast::Sender<ReloadEvent>,
-    shutdown: watch::Sender<bool>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ReloadEvent {
-    kind: &'static str,
-    paths: Vec<String>,
 }
 
 #[derive(Template)]
@@ -63,7 +46,6 @@ pub struct ReloadEvent {
 struct ShelfTemplate {
     page_title: String,
     body_class: &'static str,
-    current_document: &'static str,
     root_path: String,
     collections: Vec<CollectionView>,
     show_filter: bool,
@@ -85,7 +67,6 @@ struct CollectionView {
 struct ReaderTemplate {
     page_title: String,
     body_class: &'static str,
-    current_document: String,
     library_name: String,
     show_shelf_link: bool,
     navigation: Vec<NavigationView>,
@@ -107,7 +88,6 @@ struct NavigationView {
 struct ErrorTemplate {
     page_title: String,
     body_class: &'static str,
-    current_document: &'static str,
     status: String,
     heading: String,
     message: String,
@@ -123,86 +103,27 @@ enum MarkdownReadError {
     InvalidUtf8,
 }
 
+#[derive(Debug, Error)]
+enum CatalogLoadError {
+    #[error("{0}")]
+    Scan(#[from] ScanError),
+    #[error("the catalog scan stopped unexpectedly: {0}")]
+    Task(#[from] tokio::task::JoinError),
+}
+
 impl AppState {
     #[must_use]
     pub fn new(catalog: Catalog) -> Self {
-        let (reloads, _) = broadcast::channel(64);
-        let (shutdown, _) = watch::channel(false);
         Self {
-            catalog: Arc::new(RwLock::new(Arc::new(catalog))),
+            root: Arc::new(catalog.root().to_path_buf()),
             renderer: Arc::new(MarkdownRenderer::new()),
-            reloads,
-            shutdown,
         }
     }
 
-    pub async fn catalog(&self) -> Arc<Catalog> {
-        let catalog = self.catalog.read().await;
-        Arc::clone(&*catalog)
-    }
-
-    pub async fn replace_catalog(&self, catalog: Catalog) -> bool {
-        let catalog = Arc::new(catalog);
-        let changed = {
-            let current = self.catalog.read().await;
-            current.fingerprint() != catalog.fingerprint()
-        };
-        *self.catalog.write().await = catalog;
-        changed
-    }
-
-    pub fn notify(&self, event: ReloadEvent) {
-        let _ = self.reloads.send(event);
-    }
-
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<ReloadEvent> {
-        self.reloads.subscribe()
-    }
-
-    pub fn begin_shutdown(&self) {
-        let _ = self.shutdown.send(true);
-    }
-
-    #[must_use]
-    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
-        self.shutdown.subscribe()
-    }
-}
-
-impl ReloadEvent {
-    #[must_use]
-    pub fn catalog() -> Self {
-        Self {
-            kind: "catalog",
-            paths: Vec::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn documents(paths: Vec<String>) -> Self {
-        Self {
-            kind: "documents",
-            paths,
-        }
-    }
-
-    #[must_use]
-    pub fn asset(paths: Vec<String>) -> Self {
-        Self {
-            kind: "asset",
-            paths,
-        }
-    }
-
-    #[must_use]
-    pub fn kind(&self) -> &str {
-        self.kind
-    }
-
-    #[must_use]
-    pub fn paths(&self) -> &[String] {
-        &self.paths
+    async fn load_catalog(&self) -> Result<Arc<Catalog>, CatalogLoadError> {
+        let root = Arc::clone(&self.root);
+        let catalog = tokio::task::spawn_blocking(move || Catalog::scan(root.as_ref())).await??;
+        Ok(Arc::new(catalog))
     }
 }
 
@@ -215,7 +136,6 @@ pub fn app(state: AppState) -> Router {
         .route("/_mdfolio/doc/{*path}", get(reader))
         .route("/_mdfolio/asset/{*path}", get(asset))
         .route("/_mdfolio/missing/{*path}", get(missing))
-        .route("/_mdfolio/events", get(events))
         .route("/_mdfolio/static/style.css", get(style))
         .route("/_mdfolio/static/app.js", get(script))
         .route("/_mdfolio/static/favicon.svg", get(favicon))
@@ -229,7 +149,10 @@ async fn root_redirect() -> Redirect {
 }
 
 async fn library_landing(State(state): State<AppState>) -> Response {
-    let catalog = state.catalog().await;
+    let catalog = match state.load_catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => return catalog_unavailable(&error),
+    };
     match catalog.landing() {
         Landing::Shelf => render_shelf(&catalog),
         Landing::Document(id) => catalog.document(id).map_or_else(
@@ -246,7 +169,10 @@ async fn library_landing(State(state): State<AppState>) -> Response {
 }
 
 async fn shelf(State(state): State<AppState>) -> Response {
-    let catalog = state.catalog().await;
+    let catalog = match state.load_catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => return catalog_unavailable(&error),
+    };
     render_shelf(&catalog)
 }
 
@@ -289,7 +215,6 @@ fn render_shelf(catalog: &Catalog) -> Response {
         ShelfTemplate {
             page_title: "mdfolio — repository shelf".to_owned(),
             body_class: "shelf-page",
-            current_document: "",
             root_path: catalog.root().to_string_lossy().into_owned(),
             show_filter: collections.len() > 4,
             empty: collections.is_empty(),
@@ -300,7 +225,10 @@ fn render_shelf(catalog: &Catalog) -> Response {
 }
 
 async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    let catalog = state.catalog().await;
+    let catalog = match state.load_catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => return catalog_unavailable(&error),
+    };
     let Some(relative_path) = normalize_library_path(FsPath::new(""), &path) else {
         return render_error(
             StatusCode::NOT_FOUND,
@@ -365,7 +293,6 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
         ReaderTemplate {
             page_title: format!("{} — mdfolio", document.title),
             body_class: "reader-page",
-            current_document: document.relative_path.to_string_lossy().into_owned(),
             library_name,
             show_shelf_link,
             navigation,
@@ -382,8 +309,7 @@ async fn asset(State(state): State<AppState>, Path(path): Path<String>) -> Respo
     let Some(kind) = asset_kind(&relative_path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let catalog = state.catalog().await;
-    let Some(canonical_path) = confined_path(catalog.root(), &relative_path).await else {
+    let Some(canonical_path) = confined_path(state.root.as_path(), &relative_path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut file = match tokio::fs::File::open(&canonical_path).await {
@@ -391,7 +317,6 @@ async fn asset(State(state): State<AppState>, Path(path): Path<String>) -> Respo
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let mime = mime_guess::from_path(&relative_path).first_or_octet_stream();
     let stream = async_stream::stream! {
         let mut buffer = vec![0; ASSET_CHUNK_BYTES];
         loop {
@@ -408,11 +333,11 @@ async fn asset(State(state): State<AppState>, Path(path): Path<String>) -> Respo
     let mut response = Response::new(Body::from_stream(stream));
     response
         .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_str(mime.as_ref()).unwrap());
+        .insert(CONTENT_TYPE, HeaderValue::from_static(kind.content_type()));
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if kind == AssetKind::Pdf {
+    if kind.is_pdf() {
         let filename = relative_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -421,11 +346,7 @@ async fn asset(State(state): State<AppState>, Path(path): Path<String>) -> Respo
         if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
             response.headers_mut().insert(CONTENT_DISPOSITION, value);
         }
-    } else if relative_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-    {
+    } else if kind.is_svg() {
         response.headers_mut().insert(
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("sandbox; default-src 'none'; style-src 'unsafe-inline'"),
@@ -434,57 +355,21 @@ async fn asset(State(state): State<AppState>, Path(path): Path<String>) -> Respo
     response
 }
 
-async fn missing(Path(path): Path<String>) -> Response {
+async fn missing(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    let catalog = match state.load_catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => return catalog_unavailable(&error),
+    };
+    if let Some(relative_path) = normalize_library_path(FsPath::new(""), &path)
+        && let Some(document) = catalog.resolve_document_target(&relative_path)
+    {
+        return Redirect::temporary(&document_url(&document.relative_path)).into_response();
+    }
     render_error(
         StatusCode::NOT_FOUND,
         "Page not found",
         &format!("No readable Markdown or allowed attachment matched “{path}”."),
     )
-}
-
-async fn events(State(state): State<AppState>) -> Response {
-    let mut receiver = state.reloads.subscribe();
-    let mut shutdown = state.subscribe_shutdown();
-    let stream = async_stream::stream! {
-        if *shutdown.borrow() {
-            return;
-        }
-        loop {
-            tokio::select! {
-                result = receiver.recv() => {
-                    match result {
-                        Ok(change) => {
-                            let event = Event::default()
-                                .event("reload")
-                                .json_data(change)
-                                .expect("reload events serialize");
-                            yield Ok::<Event, Infallible>(event);
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let event = Event::default()
-                                .event("reload")
-                                .json_data(ReloadEvent::catalog())
-                                .expect("reload events serialize");
-                            yield Ok::<Event, Infallible>(event);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                result = shutdown.changed() => {
-                    if result.is_err() || *shutdown.borrow() {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(20))
-                .text("still here"),
-        )
-        .into_response()
 }
 
 async fn style() -> Response {
@@ -609,11 +494,18 @@ fn render_error(status: StatusCode, heading: &str, message: &str) -> Response {
         ErrorTemplate {
             page_title: format!("{heading} — mdfolio"),
             body_class: "error-page",
-            current_document: "",
             status: status.as_str().to_owned(),
             heading: heading.to_owned(),
             message: message.to_owned(),
         },
+    )
+}
+
+fn catalog_unavailable(error: &CatalogLoadError) -> Response {
+    render_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Library unavailable",
+        &format!("The Markdown library could not be refreshed: {error}"),
     )
 }
 
@@ -624,7 +516,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
         .entry(X_CONTENT_TYPE_OPTIONS)
         .or_insert(HeaderValue::from_static("nosniff"));
     headers.entry(CONTENT_SECURITY_POLICY).or_insert(HeaderValue::from_static(
-        "default-src 'self'; img-src 'self' http: https:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'self'; img-src 'self' http: https:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     ));
     headers
         .entry("referrer-policy")
@@ -637,7 +529,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::fs;
 
     use axum::{
         body::Body,
@@ -651,7 +543,7 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    use super::{AppState, MAX_MARKDOWN_BYTES, ReloadEvent, app, read_markdown};
+    use super::{AppState, MAX_MARKDOWN_BYTES, app, read_markdown};
     use crate::catalog::Catalog;
 
     fn fixture() -> (TempDir, AppState) {
@@ -671,7 +563,11 @@ mod tests {
         )
         .unwrap();
         fs::write(temp.path().join("manual.pdf"), b"%PDF-fixture").unwrap();
-        fs::write(temp.path().join("_mdfolio/events.md"), "# Not an endpoint").unwrap();
+        fs::write(
+            temp.path().join("_mdfolio/static-style.md"),
+            "# Reserved-looking document",
+        )
+        .unwrap();
         let state = AppState::new(Catalog::scan(temp.path()).unwrap());
         (temp, state)
     }
@@ -727,6 +623,7 @@ mod tests {
         assert!(body.contains("<h1 id=\"a-quiet-book\">A Quiet Book"));
         assert!(body.contains("/_mdfolio/asset/images/cover.svg"));
         assert!(body.contains("class=\"folio-nav\""));
+        assert!(!body.contains("data-document"));
     }
 
     #[tokio::test]
@@ -750,6 +647,7 @@ mod tests {
                 .unwrap()
                 .to_owned();
             assert!(csp.contains("script-src 'self'"));
+            assert!(csp.contains("connect-src 'none'"));
             assert!(!csp.contains("'unsafe-inline'"));
 
             let body = body_text(response).await;
@@ -776,6 +674,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("sandbox")
+        );
+    }
+
+    #[tokio::test]
+    async fn uppercase_svg_assets_keep_the_exact_type_and_sandbox() {
+        let (temp, state) = fixture();
+        fs::write(
+            temp.path().join("images/COVER.SVG"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        )
+        .unwrap();
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/_mdfolio/asset/images/COVER.SVG")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
         assert!(
             response
                 .headers()
@@ -820,6 +752,7 @@ mod tests {
     async fn document_route_requires_catalog_membership() {
         let (temp, state) = fixture();
         fs::write(temp.path().join("secret.md"), "# Secret").unwrap();
+        fs::write(temp.path().join(".gitignore"), "secret.md\n").unwrap();
         let response = app(state)
             .oneshot(
                 Request::builder()
@@ -857,7 +790,7 @@ mod tests {
         let response = app(state)
             .oneshot(
                 Request::builder()
-                    .uri("/_mdfolio/doc/_mdfolio/events.md")
+                    .uri("/_mdfolio/doc/_mdfolio/static-style.md")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -865,7 +798,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(body_text(response).await.contains("Not an endpoint"));
+        assert!(
+            body_text(response)
+                .await
+                .contains("Reserved-looking document")
+        );
     }
 
     #[cfg(unix)]
@@ -956,35 +893,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_stream_delivers_catalog_reload_after_a_swap() {
-        let (_temp, state) = fixture();
-        let response = app(state.clone())
+    async fn shelf_request_discovers_a_new_repository() {
+        let (temp, state) = fixture();
+        fs::create_dir_all(temp.path().join("new-repo/.git")).unwrap();
+        fs::write(
+            temp.path().join("new-repo/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("new-repo/README.md"), "# New Collection").unwrap();
+
+        let response = app(state)
             .oneshot(
                 Request::builder()
-                    .uri("/_mdfolio/events")
+                    .uri("/_mdfolio/shelf")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        state.notify(ReloadEvent::catalog());
-
-        let mut body = response.into_body();
-        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
-            .await
-            .expect("event stream timed out")
-            .expect("event stream ended")
-            .expect("event stream failed");
-        let data = frame.into_data().expect("first SSE frame is data");
-        let data = String::from_utf8(data.to_vec()).unwrap();
-        assert!(data.contains("event: reload"));
-        assert!(data.contains("\"kind\":\"catalog\""));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(body.contains("<strong>new-repo</strong>"));
+        assert!(body.contains("href=\"/_mdfolio/doc/new-repo/README.md\""));
     }
 
     #[tokio::test]
-    async fn event_stream_ends_when_shutdown_begins() {
-        let (_temp, state) = fixture();
+    async fn each_reader_request_refreshes_body_membership_navigation_and_links() {
+        let (temp, state) = fixture();
+        fs::write(
+            temp.path().join("README.md"),
+            "# Revised Book\n\nRead the [new page](new-page).",
+        )
+        .unwrap();
+        fs::write(temp.path().join("new-page.md"), "# Newly Added").unwrap();
+
         let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/_mdfolio/doc/README.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response).await;
+        assert!(body.contains("<h1 id=\"revised-book\">Revised Book"));
+        assert!(body.contains("href=\"/_mdfolio/doc/new-page.md\""));
+        assert!(body.contains("<strong>Newly Added</strong>"));
+
+        fs::rename(
+            temp.path().join("new-page.md"),
+            temp.path().join("renamed.md"),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("README.md"),
+            "# Revised Again\n\nRead the [renamed page](renamed).",
+        )
+        .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/_mdfolio/doc/README.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response).await;
+        assert!(body.contains("<h1 id=\"revised-again\">Revised Again"));
+        assert!(body.contains("href=\"/_mdfolio/doc/renamed.md\""));
+        assert!(!body.contains("/_mdfolio/doc/new-page.md"));
+
+        fs::remove_file(temp.path().join("renamed.md")).unwrap();
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/_mdfolio/doc/renamed.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn refreshing_a_missing_target_redirects_when_the_document_appears() {
+        let (temp, state) = fixture();
+        let request = || {
+            Request::builder()
+                .uri("/_mdfolio/missing/future")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let response = app(state.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        fs::write(temp.path().join("future.md"), "# Future").unwrap();
+        let response = app(state).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get(LOCATION).unwrap(),
+            "/_mdfolio/doc/future.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refreshes_return_service_unavailable_without_stale_content() {
+        let (temp, state) = fixture();
+        fs::remove_dir_all(temp.path()).unwrap();
+
+        for uri in [
+            "/_mdfolio/",
+            "/_mdfolio/shelf",
+            "/_mdfolio/doc/README.md",
+            "/_mdfolio/missing/future",
+        ] {
+            let response = app(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = body_text(response).await;
+            assert!(body.contains("Library unavailable"), "{uri}");
+            assert!(!body.contains("A Quiet Book"), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_event_endpoint_is_not_found() {
+        let (_temp, state) = fixture();
+        let response = app(state)
             .oneshot(
                 Request::builder()
                     .uri("/_mdfolio/events")
@@ -993,14 +1036,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut body = response.into_body();
 
-        state.begin_shutdown();
-
-        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
-            .await
-            .expect("event stream did not observe shutdown");
-        assert!(frame.is_none(), "event stream emitted after shutdown");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
