@@ -256,7 +256,7 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
             return render_error(
                 error.status(),
                 "Page unavailable",
-                &format!("The Markdown file could not be read: {error}"),
+                &format!("mdfolio failed to read the Markdown file: {error}"),
             );
         }
     };
@@ -269,7 +269,7 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
             || "Loose folios".to_owned(),
             |repository| repository.name.clone(),
         );
-    let show_shelf_link = collection_count(&catalog) > 1;
+    let show_shelf_link = catalog.collection_count() > 1;
     let renderer = Arc::clone(&state.renderer);
     let render_catalog = Arc::clone(&catalog);
     let render_document = document.clone();
@@ -430,10 +430,6 @@ fn navigation_for(catalog: &Catalog, current: DocumentId) -> Vec<NavigationView>
         .collect()
 }
 
-fn collection_count(catalog: &Catalog) -> usize {
-    catalog.repositories().len() + usize::from(!catalog.loose_documents().is_empty())
-}
-
 async fn confined_path(root: &FsPath, relative_path: &FsPath) -> Option<PathBuf> {
     let canonical = tokio::fs::canonicalize(root.join(relative_path))
         .await
@@ -505,7 +501,7 @@ fn catalog_unavailable(error: &CatalogLoadError) -> Response {
     render_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "Library unavailable",
-        &format!("The Markdown library could not be refreshed: {error}"),
+        &format!("mdfolio failed to refresh the Markdown library: {error}"),
     )
 }
 

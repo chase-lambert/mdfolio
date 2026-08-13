@@ -151,7 +151,7 @@ fn parse_port(value: &OsStr) -> Result<u16, CliError> {
         .ok_or_else(|| CliError(format!("invalid port '{printable}'")))?;
     value.parse().map_err(|_| {
         CliError(format!(
-            "invalid port '{printable}'; expected 0 through 65535"
+            "invalid port '{printable}' (expected 0 through 65535)"
         ))
     })
 }
@@ -165,7 +165,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         .map_err(|source| {
             io::Error::new(
                 source.kind(),
-                format!("could not bind 127.0.0.1:{}: {source}", cli.port),
+                format!("binding 127.0.0.1:{} failed: {source}", cli.port),
             )
         })?;
     let address = listener.local_addr()?;
@@ -201,13 +201,13 @@ fn open_browser(url: String) {
             {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
-                    eprintln!("warning: could not open the browser: xdg-open exited with {status}");
+                    eprintln!("warning: the browser did not open: xdg-open exited with {status}");
                 }
-                Err(error) => eprintln!("warning: could not open the browser: {error}"),
+                Err(error) => eprintln!("warning: the browser did not open: {error}"),
             }
         });
     if let Err(error) = result {
-        eprintln!("warning: could not start the browser opener: {error}");
+        eprintln!("warning: the browser opener did not start: {error}");
     }
 }
 
@@ -229,7 +229,7 @@ fn print_catalog_summary(catalog: &Catalog) {
 
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("warning: could not listen for Ctrl-C: {error}");
+        eprintln!("warning: listening for Ctrl-C failed: {error}");
     }
 }
 

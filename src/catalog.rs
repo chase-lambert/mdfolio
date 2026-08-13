@@ -103,6 +103,7 @@ impl Catalog {
 
         let mut diagnostics = Vec::new();
         let mut pending = Vec::new();
+        let mut boundaries: HashMap<PathBuf, bool> = HashMap::new();
 
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -154,12 +155,12 @@ impl Catalog {
                 Err(error) => {
                     diagnostics.push(CatalogDiagnostic {
                         path: Some(relative_path.to_path_buf()),
-                        message: format!("could not read title: {error}"),
+                        message: format!("reading the title failed: {error}"),
                     });
                     file_stem_title(relative_path)
                 }
             };
-            let repository_root = nearest_repository_root(&root, entry.path());
+            let repository_root = nearest_repository_root(&root, entry.path(), &mut boundaries);
             pending.push(PendingDocument {
                 relative_path: relative_path.to_path_buf(),
                 title,
@@ -167,15 +168,14 @@ impl Catalog {
             });
         }
 
-        pending.sort_by(|left, right| {
-            path_sort_key(&left.relative_path).cmp(&path_sort_key(&right.relative_path))
-        });
+        pending.sort_by_cached_key(|document| path_sort_key(&document.relative_path));
 
         let repository_roots: Vec<PathBuf> = pending
             .iter()
-            .filter_map(|document| document.repository_root.clone())
+            .filter_map(|document| document.repository_root.as_deref())
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .map(Path::to_path_buf)
             .collect();
         let repository_ids: HashMap<PathBuf, RepositoryId> = repository_roots
             .iter()
@@ -211,7 +211,7 @@ impl Catalog {
         }
         for (repository_id, ids) in repository_documents.iter_mut().enumerate() {
             let collection_root = &repository_roots[repository_id];
-            ids.sort_by_key(|id| {
+            ids.sort_by_cached_key(|id| {
                 let relative = documents[*id]
                     .relative_path
                     .strip_prefix(collection_root)
@@ -219,7 +219,8 @@ impl Catalog {
                 default_document_sort_key(relative)
             });
         }
-        loose_documents.sort_by_key(|id| default_document_sort_key(&documents[*id].relative_path));
+        loose_documents
+            .sort_by_cached_key(|id| default_document_sort_key(&documents[*id].relative_path));
 
         let mut repositories: Vec<Repository> = repository_roots
             .into_iter()
@@ -251,21 +252,21 @@ impl Catalog {
             .collect();
         qualify_duplicate_repository_names(&mut repositories);
 
-        let collection_count = repositories.len() + usize::from(!loose_documents.is_empty());
-        let mode = if collection_count <= 1 {
-            CatalogMode::SingleLibrary
-        } else {
-            CatalogMode::Shelf
-        };
-        Ok(Self {
+        let mut catalog = Self {
             root,
-            mode,
+            mode: CatalogMode::SingleLibrary,
             repositories,
             documents,
             loose_documents,
             by_path,
             diagnostics,
-        })
+        };
+        catalog.mode = if catalog.collection_count() <= 1 {
+            CatalogMode::SingleLibrary
+        } else {
+            CatalogMode::Shelf
+        };
+        Ok(catalog)
     }
 
     #[must_use]
@@ -305,6 +306,11 @@ impl Catalog {
     }
 
     #[must_use]
+    pub fn collection_count(&self) -> usize {
+        self.repositories.len() + usize::from(!self.loose_documents.is_empty())
+    }
+
+    #[must_use]
     pub fn document(&self, id: DocumentId) -> Option<&Document> {
         self.documents.get(id)
     }
@@ -338,13 +344,17 @@ impl Catalog {
             }
         }
 
-        let ids: Vec<DocumentId> = self
-            .documents
+        self.documents
             .iter()
             .filter(|document| document.relative_path.starts_with(target))
-            .map(|document| document.id)
-            .collect();
-        choose_default_document(&self.documents, &ids, target).and_then(|id| self.document(id))
+            .min_by_key(|document| {
+                default_document_sort_key(
+                    document
+                        .relative_path
+                        .strip_prefix(target)
+                        .unwrap_or(&document.relative_path),
+                )
+            })
     }
 
     #[must_use]
@@ -429,10 +439,22 @@ fn is_hard_excluded(name: &OsStr) -> bool {
     })
 }
 
-fn nearest_repository_root(root: &Path, document_path: &Path) -> Option<PathBuf> {
+fn nearest_repository_root(
+    root: &Path,
+    document_path: &Path,
+    boundaries: &mut HashMap<PathBuf, bool>,
+) -> Option<PathBuf> {
     let mut current = document_path.parent()?;
     loop {
-        if is_git_boundary(current) {
+        let is_boundary = match boundaries.get(current) {
+            Some(&is_boundary) => is_boundary,
+            None => {
+                let is_boundary = is_git_boundary(current);
+                boundaries.insert(current.to_path_buf(), is_boundary);
+                is_boundary
+            }
+        };
+        if is_boundary {
             return current.strip_prefix(root).ok().map(Path::to_path_buf);
         }
         if current == root {
@@ -450,8 +472,19 @@ fn read_title(path: &Path) -> io::Result<Option<String>> {
 }
 
 fn extract_title(markdown: &str) -> Option<String> {
-    let lines: Vec<&str> = markdown.lines().collect();
-    for (index, line) in lines.iter().enumerate() {
+    let mut previous: Option<&str> = None;
+    for line in markdown.lines() {
+        if let Some(previous_line) = previous {
+            let underline = line.trim();
+            let is_setext = !underline.is_empty()
+                && (underline.bytes().all(|byte| byte == b'=')
+                    || underline.bytes().all(|byte| byte == b'-'));
+            let title = previous_line.trim();
+            if is_setext && !title.is_empty() {
+                return plain_inline_title(title);
+            }
+        }
+
         let trimmed = line.trim_start();
         let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
         if (1..=6).contains(&hashes)
@@ -465,17 +498,7 @@ fn extract_title(markdown: &str) -> Option<String> {
                 return plain_inline_title(title);
             }
         }
-
-        if index + 1 < lines.len() {
-            let underline = lines[index + 1].trim();
-            let is_setext = !underline.is_empty()
-                && (underline.bytes().all(|byte| byte == b'=')
-                    || underline.bytes().all(|byte| byte == b'-'));
-            let title = line.trim();
-            if is_setext && !title.is_empty() {
-                return plain_inline_title(title);
-            }
-        }
+        previous = Some(line);
     }
     None
 }
@@ -765,6 +788,70 @@ mod tests {
                 .unwrap()
                 .title,
             "A Quiet Book"
+        );
+    }
+
+    #[test]
+    fn atx_title_takes_precedence_over_a_setext_underline() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "precedence.md", "# A##\n===\n");
+
+        let catalog = Catalog::scan(temp.path()).unwrap();
+
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("precedence.md"))
+                .unwrap()
+                .title,
+            "A"
+        );
+    }
+
+    #[test]
+    fn setext_title_wins_over_a_later_atx_heading() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "setext-first.md", "Title\n===\n# Other\n");
+
+        let catalog = Catalog::scan(temp.path()).unwrap();
+
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("setext-first.md"))
+                .unwrap()
+                .title,
+            "Title"
+        );
+    }
+
+    #[test]
+    fn empty_atx_heading_falls_through_to_the_next_candidate() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "empty-atx.md", "# \nTitle\n===\n");
+
+        let catalog = Catalog::scan(temp.path()).unwrap();
+
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("empty-atx.md"))
+                .unwrap()
+                .title,
+            "Title"
+        );
+    }
+
+    #[test]
+    fn image_only_first_heading_falls_back_to_the_stem() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "image-only.md", "# ![](x.png)\n# Real\n");
+
+        let catalog = Catalog::scan(temp.path()).unwrap();
+
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("image-only.md"))
+                .unwrap()
+                .title,
+            "image only"
         );
     }
 

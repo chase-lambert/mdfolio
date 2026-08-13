@@ -1,8 +1,8 @@
 # mdfolio
 
 `mdfolio` is a quiet local reader for the Markdown already in your
-repositories. Point it at one repository to open its README, or at a directory
-of repositories to browse them as a shelf.
+repositories. Point it at one repository to open its README. Point it at a
+directory of repositories to browse them as a shelf.
 
 It does not import, reorganize, or generate documentation. The filesystem is
 the catalog.
@@ -33,89 +33,89 @@ Open a repository shelf:
 mdfolio ~/projects
 ```
 
-By default, `mdfolio` binds to an available loopback port and opens the browser.
-Keep the browser closed or choose a stable port when needed:
+By default, `mdfolio` binds to an available loopback port and opens the
+browser. Keep the browser closed or choose a stable port when needed:
 
 ```sh
 mdfolio ~/projects --no-open
 mdfolio ~/projects --port 4040
 ```
 
-On Linux, browser opening uses `xdg-open`. If it is unavailable or fails, the
-local URL remains printed for manual opening. The server remains in the
-foreground until `Ctrl-C`.
+On Linux, `mdfolio` opens the browser with `xdg-open`. If `xdg-open` is
+unavailable or fails, `mdfolio` still prints the local URL for manual opening.
+The server stays in the foreground until `Ctrl-C`.
 
 ## Appearance
 
 Use the controls in the page header to choose a theme and switch between light
 and dark modes. The built-in themes are:
 
-- **Folio** — warm paper and umber;
-- **Linen** — airy neutrals and cool blue;
-- **Grove** — mineral and botanical tones;
+- **Folio** — warm paper and umber.
+- **Linen** — airy neutrals and cool blue.
+- **Grove** — mineral and botanical tones.
 - **Nocturne (dark)** — a dark-only indigo theme.
 
-Theme and mode are remembered independently in browser storage. A dark-only
-theme temporarily uses dark mode without changing the preferred mode that
-returns with a light-and-dark theme. Before a mode is chosen explicitly,
+The browser stores the theme and the mode independently. A dark-only theme
+uses dark mode while it is active. It does not change the preferred mode. A
+light-and-dark theme restores that preferred mode. Until you choose a mode,
 `mdfolio` follows the operating-system preference.
 
-Browser storage is scoped to the complete local address, including its port.
-The default available port may change between launches; use a stable
+The browser scopes storage to the complete local address, including its port.
+The default available port can change between launches. Use a stable
 `--port`, such as `--port 4040`, to keep one remembered appearance across
 restarts.
 
 ## Reading model
 
-- `.md` and `.markdown` files are discovered recursively and matched
+- `mdfolio` discovers `.md` and `.markdown` files recursively and matches them
   case-insensitively.
 - Git boundaries group documents into repositories. One collection opens
-  directly; multiple repositories or loose documents open the shelf.
-- The selected directory is a strict library root. Running inside a repository
-  subdirectory does not walk upward to import its parent `.git` or files; that
-  subtree appears as one loose folio.
+  directly. Multiple repositories or loose documents open the shelf.
+- The selected directory is a strict library root. A repository subdirectory
+  does not import its parent `.git` or files. That subtree appears as one
+  loose folio.
 - A repository opens `README.md`, then a root `index.md`, then its shallowest
   alphabetical Markdown path. Matching is case-insensitive and deterministic.
-- Repository-local `.gitignore`, `.git/info/exclude`, and `.ignore` files are
-  honored. Common dependency and build caches are always excluded.
-- Hidden authoring directories such as `.agents` remain visible unless ignored.
+- `mdfolio` honors repository-local `.gitignore`, `.git/info/exclude`, and
+  `.ignore` files. It always excludes common dependency and build caches.
+- Hidden authoring directories such as `.agents` stay visible unless ignored.
 - Refresh the browser to pick up Markdown edits and current filesystem
-  membership. `mdfolio` also rescans when opening the library, navigating its
-  shelf or readers, or revisiting a previously missing document; it does not
+  membership. `mdfolio` also rescans when it opens the library, serves the
+  shelf or a reader, or revisits a previously missing document. It does not
   watch files or refresh pages in the background.
-- The shelf and page list filter by repository name, title, and path. Press `/`
-  outside a form field to focus the filter.
+- The shelf and page list filter by repository name, title, and path. Press
+  `/` outside a form field to focus the filter.
 
 ## Markdown and links
 
-Rendering supports CommonMark and common GitHub-flavored features, including
-tables, task lists, strikethrough, footnotes, description lists, heading
-anchors, and server-side syntax highlighting. Fenced languages outside
-Syntect's built-in syntax set remain readable as plain code.
+`mdfolio` renders CommonMark and common GitHub-flavored features: tables, task
+lists, strikethrough, footnotes, description lists, heading anchors, and
+server-side syntax highlighting. Fenced languages outside Syntect's built-in
+syntax set remain readable as plain code.
 
-Relative Markdown links resolve through the catalog. Extensionless links,
-directory links, scan-root-relative links, and heading fragments are supported.
-Relative images may use PNG, JPEG, GIF, SVG, WebP, or AVIF. PDF is the only
-other local attachment type and is downloaded rather than embedded.
+Relative Markdown links resolve through the catalog. `mdfolio` supports
+extensionless links, directory links, scan-root-relative links, and heading
+fragments. Relative images can use PNG, JPEG, GIF, SVG, WebP, or AVIF. PDF is
+the only other local attachment type, and the browser downloads it as a file.
 
-External HTTP(S) links and images and `mailto:` links are allowed.
-`javascript:`, `file:`, `data:`, arbitrary local attachments, and MDX execution
-are blocked.
+`mdfolio` allows external HTTP(S) links and images and `mailto:` links. It
+blocks `javascript:`, `file:`, `data:`, arbitrary local attachments, and MDX
+execution.
 
 ## Local security boundary
 
 `mdfolio` is read-only and binds only to `127.0.0.1`. Document routes require
-catalog membership, asset paths are canonicalized beneath the selected root,
-raw HTML is sanitized, SVG responses are sandboxed, and symlinked directories
-are not scanned. An in-root symlinked image or PDF may be served; an out-of-root
-target is rejected.
+catalog membership. `mdfolio` canonicalizes asset paths beneath the selected
+root, sanitizes raw HTML, and sandboxes SVG responses. It does not scan
+symlinked directories. An in-root symlinked image or PDF can be served.
+`mdfolio` rejects an out-of-root target.
 
-Paths containing invalid UTF-8 are skipped with a terminal warning because they
-cannot have an unambiguous browser URL.
+`mdfolio` skips paths with invalid UTF-8 and prints a terminal warning. Such
+paths cannot have an unambiguous browser URL.
 
-Markdown pages are limited to 16 MiB so concurrent browser requests have a
-bounded rendering cost. Allowed images and PDFs are streamed in 64 KiB chunks
-rather than loaded into memory as whole files.
+Markdown pages have a 16 MiB limit. The limit bounds the rendering cost of
+concurrent browser requests. `mdfolio` streams allowed images and PDFs in
+64 KiB chunks. It does not load whole files into memory.
 
 ## Development
 
@@ -133,18 +133,18 @@ cargo build --release
 
 Each direct runtime dependency has one narrow job:
 
-- `comrak` parses Markdown and integrates Syntect highlighting; `ammonia`
-  sanitizes the resulting HTML; `askama` escapes and renders the application
+- `comrak` parses Markdown and integrates Syntect highlighting. `ammonia`
+  sanitizes the resulting HTML. `askama` escapes and renders the application
   shell.
-- `axum` serves loopback HTTP on Tokio; only Axum's `http1` and `tokio`
-  features are enabled, and Tokio enables only the filesystem, I/O, macros,
-  networking, current-thread runtime, and signal support used by the binary.
+- `axum` serves loopback HTTP on Tokio. The build enables only the `http1` and
+  `tokio` features of Axum. Tokio enables only the filesystem, I/O, macros,
+  networking, current-thread runtime, and signal support that the binary uses.
 - `ignore` applies Git-compatible discovery rules on each catalog scan.
-- `async-stream` expresses bounded asset streams; `percent-encoding` makes
-  browser paths unambiguous; and `thiserror` defines the catalog and server
-  error boundaries.
+- `async-stream` expresses bounded asset streams. `percent-encoding` makes
+  browser paths unambiguous. `thiserror` defines the catalog and server error
+  boundaries.
 
 The catalog in `src/catalog.rs` is the canonical data core. HTTP and rendering
 code address documents by stable root-relative paths rather than scan-order
-IDs. Each shelf or reader request owns a fresh catalog scan, while application
-state retains only the canonical library root and Markdown renderer.
+IDs. Each shelf or reader request owns a fresh catalog scan. The application
+state retains only the canonical library root and the Markdown renderer.

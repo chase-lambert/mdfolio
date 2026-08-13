@@ -38,11 +38,16 @@ pub fn missing_url(target: &Path) -> String {
 
 #[must_use]
 pub fn encode_relative_path(path: &Path) -> String {
-    path.iter()
-        .filter_map(|component| component.to_str())
-        .map(|component| utf8_percent_encode(component, URL_PATH_ENCODE_SET).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut encoded = String::new();
+    for component in path.iter().filter_map(|component| component.to_str()) {
+        if !encoded.is_empty() {
+            encoded.push('/');
+        }
+        for piece in utf8_percent_encode(component, URL_PATH_ENCODE_SET) {
+            encoded.push_str(piece);
+        }
+    }
+    encoded
 }
 
 pub fn normalize_library_path(base_directory: &Path, raw: &str) -> Option<PathBuf> {
