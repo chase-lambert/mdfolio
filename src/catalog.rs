@@ -104,6 +104,7 @@ impl Catalog {
         let mut diagnostics = Vec::new();
         let mut pending = Vec::new();
         let mut boundaries: HashMap<PathBuf, bool> = HashMap::new();
+        let mut title_buf = Vec::new();
 
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -150,7 +151,7 @@ impl Catalog {
                 continue;
             }
 
-            let title = match read_title(entry.path()) {
+            let title = match read_title(entry.path(), &mut title_buf) {
                 Ok(title) => title.unwrap_or_else(|| file_stem_title(relative_path)),
                 Err(error) => {
                     diagnostics.push(CatalogDiagnostic {
@@ -464,11 +465,11 @@ fn nearest_repository_root(
     }
 }
 
-fn read_title(path: &Path) -> io::Result<Option<String>> {
+fn read_title(path: &Path, buf: &mut Vec<u8>) -> io::Result<Option<String>> {
+    buf.clear();
     let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(TITLE_PREFIX_BYTES).read_to_end(&mut bytes)?;
-    Ok(extract_title(&String::from_utf8_lossy(&bytes)))
+    file.take(TITLE_PREFIX_BYTES).read_to_end(buf)?;
+    Ok(extract_title(&String::from_utf8_lossy(buf)))
 }
 
 fn extract_title(markdown: &str) -> Option<String> {
@@ -503,7 +504,38 @@ fn extract_title(markdown: &str) -> Option<String> {
     None
 }
 
+fn heading_has_inline_markup(markdown: &str) -> bool {
+    markdown
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'_' | b'`' | b'[' | b']' | b'<' | b'&' | b'\\'))
+}
+
+/// Comrak treats these as block openers inside the heading, so the marker
+/// never becomes a text node. The fast path must not keep them as title text.
+fn heading_looks_like_block(markdown: &str) -> bool {
+    let trimmed = markdown.trim_start();
+    if trimmed.starts_with('>') || trimmed.starts_with("- ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    matches!(
+        trimmed.as_bytes().get(digits..),
+        Some([b'.' | b')', b' ' | b'\t', ..])
+    )
+}
+
+fn collapse_heading_whitespace(markdown: &str) -> Option<String> {
+    let title = markdown.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
 fn plain_inline_title(markdown: &str) -> Option<String> {
+    if !heading_has_inline_markup(markdown) && !heading_looks_like_block(markdown) {
+        return collapse_heading_whitespace(markdown);
+    }
     let arena = Arena::new();
     let root = parse_document(&arena, markdown, &Options::default());
     let mut title = String::new();
@@ -515,8 +547,7 @@ fn plain_inline_title(markdown: &str) -> Option<String> {
             _ => {}
         }
     }
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!title.is_empty()).then_some(title)
+    collapse_heading_whitespace(&title)
 }
 
 fn file_stem_title(path: &Path) -> String {
@@ -836,6 +867,54 @@ mod tests {
                 .unwrap()
                 .title,
             "Title"
+        );
+    }
+
+    #[test]
+    fn list_and_quote_markers_in_headings_do_not_become_title_text() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "numbered.md", "# 1. Introduction\n");
+        write(temp.path(), "dash.md", "# - item\n");
+        write(temp.path(), "quote.md", "# > note\n");
+
+        let catalog = Catalog::scan(temp.path()).unwrap();
+
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("numbered.md"))
+                .unwrap()
+                .title,
+            "Introduction"
+        );
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("dash.md"))
+                .unwrap()
+                .title,
+            "item"
+        );
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("quote.md"))
+                .unwrap()
+                .title,
+            "note"
+        );
+    }
+
+    #[test]
+    fn entity_reference_in_heading_decodes() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "entities.md", "# Q&amp;A\n");
+
+        let catalog = Catalog::scan(temp.path()).unwrap();
+
+        assert_eq!(
+            catalog
+                .document_by_path(Path::new("entities.md"))
+                .unwrap()
+                .title,
+            "Q&A"
         );
     }
 

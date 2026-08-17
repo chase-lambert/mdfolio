@@ -236,7 +236,7 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
             "That path leaves the selected library.",
         );
     };
-    let Some(document) = catalog.document_by_path(&relative_path).cloned() else {
+    let Some(document_id) = catalog.document_by_path(&relative_path).map(|d| d.id) else {
         return render_error(
             StatusCode::NOT_FOUND,
             "Page not found",
@@ -261,7 +261,10 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
         }
     };
 
-    let navigation = navigation_for(&catalog, document.id);
+    let navigation = navigation_for(&catalog, document_id);
+    let document = catalog
+        .document(document_id)
+        .expect("id came from this catalog");
     let library_name = document
         .repository
         .and_then(|id| catalog.repositories().get(id))
@@ -269,12 +272,16 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
             || "Loose folios".to_owned(),
             |repository| repository.name.clone(),
         );
+    let page_title = format!("{} — mdfolio", document.title);
+    let document_path = document.relative_path.to_string_lossy().into_owned();
     let show_shelf_link = catalog.collection_count() > 1;
     let renderer = Arc::clone(&state.renderer);
     let render_catalog = Arc::clone(&catalog);
-    let render_document = document.clone();
     let article_html = match tokio::task::spawn_blocking(move || {
-        renderer.render(&markdown, &render_document, render_catalog)
+        let document = render_catalog
+            .document(document_id)
+            .expect("id came from this catalog");
+        renderer.render(&markdown, document, Arc::clone(&render_catalog))
     })
     .await
     {
@@ -291,12 +298,12 @@ async fn reader(State(state): State<AppState>, Path(path): Path<String>) -> Resp
     render_template(
         StatusCode::OK,
         ReaderTemplate {
-            page_title: format!("{} — mdfolio", document.title),
+            page_title,
             body_class: "reader-page",
             library_name,
             show_shelf_link,
             navigation,
-            document_path: document.relative_path.to_string_lossy().into_owned(),
+            document_path,
             article_html,
         },
     )
